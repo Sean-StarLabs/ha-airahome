@@ -28,6 +28,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import AiraDataUpdateCoordinator
+from .controls import AiraPendingControls
 from .services import async_setup_services
 
 
@@ -56,7 +57,7 @@ async def connect_with_cache_retry(aira: AiraHome, ble_device: BLEDevice, mac_ad
         raise BLEConnectionError("BLE connection retry failed after clearing cache")
 
 
-PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.WATER_HEATER, Platform.CLIMATE]
+PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.WATER_HEATER, Platform.CLIMATE, Platform.DATE, Platform.SELECT, Platform.BUTTON]
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
@@ -156,7 +157,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Store the coordinator and AiraHome instance for the platforms to use
     hass.data[DOMAIN][entry.entry_id] = {
         "coordinator": coordinator,
-        "aira": aira
+        "aira": aira,
+        "pending_controls": AiraPendingControls(),
     }
     entry.async_on_unload(coordinator.async_shutdown)
     

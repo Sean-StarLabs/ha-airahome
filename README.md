@@ -32,7 +32,12 @@ Once set up, you get:
 - **Hot water control** — DHW target temperature, boost mode, scheduler awareness
 - **Sensors** — temperatures, power, energy, COP, flow rates, compressor data, and more
 - **Binary sensors** — connection status, active modes, alarms, circulator pumps
-- **Services** — activate/deactivate DHW boost
+- **Controls** — pending Away start/end dates and DHW boost duration, with explicit activate/cancel buttons and a one-hour night mode button
+- **Services** — set/clear Away mode, activate/deactivate DHW boost, activate night mode
+
+Away dates and boost duration are local selections restored across restarts. Editing them does not change the heat pump. Press **Activate Away** or **Start DHW boost** to apply them. New selections default to today, three days later, and one hour. Away activation requires a start date of today or later and at least three days between dates; restored dates are validated again when activated.
+
+**Clear Away** and **Cancel DHW boost** send their dedicated cancel commands. Night mode lasts one hour and has no early cancel command in the SDK. Buttons require a connected heat pump. Commands request a state refresh after acknowledgement; existing mode sensors report the device state. **DHW boost active** compares the reported boost end with the current time on each coordinator update and is unknown when no valid active boost end is reported. Existing climate, hot water and schedule controls are unchanged.
 
 For the full list of available entities, see the [Features & Entities](https://github.com/Invy55/ha-airahome/wiki/Features-and-Entities) wiki page.
 

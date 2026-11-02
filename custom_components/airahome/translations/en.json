@@ -50,6 +50,18 @@
     }
   },
   "exceptions": {
+    "no_aira_target": {
+      "message": "Select at least one loaded Aira heat pump entity, device or area."
+    },
+    "device_not_connected": {
+      "message": "The Aira heat pump is not connected."
+    },
+    "away_mode_clear_failed": {
+      "message": "Failed to clear Away mode: {error}"
+    },
+    "night_mode_activate_failed": {
+      "message": "Failed to activate night mode for one hour: {error}"
+    },
     "temperature_not_provided": {
       "message": "Temperature not provided. Please specify a temperature in °С."
     },
@@ -105,6 +117,46 @@
     }
   },
   "entity": {
+    "date": {
+      "away_start_date": {
+        "name": "Away start (pending)"
+      },
+      "away_end_date": {
+        "name": "Away end (pending)"
+      }
+    },
+    "select": {
+      "dhw_boost_duration": {
+        "name": "DHW boost duration (pending)",
+        "state": {
+          "1": "1 hour",
+          "2": "2 hours",
+          "3": "3 hours",
+          "4": "4 hours",
+          "6": "6 hours",
+          "8": "8 hours",
+          "12": "12 hours",
+          "24": "24 hours"
+        }
+      }
+    },
+    "button": {
+      "activate_away": {
+        "name": "Activate Away"
+      },
+      "clear_away": {
+        "name": "Clear Away"
+      },
+      "start_dhw_boost": {
+        "name": "Start DHW boost"
+      },
+      "cancel_dhw_boost": {
+        "name": "Cancel DHW boost"
+      },
+      "activate_night_mode": {
+        "name": "Activate night mode for 1 hour"
+      }
+    },
     "sensor": {
       "hot_water_temp": { "name": "DHW Temperature" },
       "target_hot_water_temp": { "name": "Target DHW Temperature" },
@@ -240,6 +292,7 @@
       "dhw_boost_end": { "name": "DHW Boost End" }
     },
     "binary_sensor": {
+      "dhw_boost_active": { "name": "DHW boost active" },
       "connection": { "name": "Connection Status" },
       "manual_mode": { "name": "Manual Mode" },
       "night_mode": { "name": "Night Mode" },
@@ -265,6 +318,14 @@
     }
   },
   "services": {
+    "clear_away_mode": {
+      "name": "Clear Away mode",
+      "description": "Clears Away mode on the selected heat pump."
+    },
+    "activate_night_mode": {
+      "name": "Activate night mode",
+      "description": "Activates night mode for one hour. There is no early cancel command."
+    },
     "set_away_mode": {
       "name": "Set Away Mode",
       "description": "Activates away mode for the specified date range. The end date must be at least 3 days after the start date.",

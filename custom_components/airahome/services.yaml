@@ -46,3 +46,14 @@ activate_dhw_boost:
               value: "12"
             - label: "24 hours"
               value: "24"
+
+
+clear_away_mode:
+  target:
+    entity:
+      - integration: airahome
+
+activate_night_mode:
+  target:
+    entity:
+      - integration: airahome

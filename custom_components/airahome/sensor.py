@@ -32,6 +32,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 import homeassistant.util.dt as dt_util
 
+from .boost import boost_end_time
 from .const import (
     CONF_DEVICE_NAME,
     CONF_DEVICE_UUID,
@@ -1478,24 +1479,7 @@ class AiraWaterBoostEndSensor(AiraSensorBase):
 
     @property
     def native_value(self) -> datetime | None: # type: ignore
-        if not self.coordinator.data:
-            return None
-        try:
-            schedules = self.coordinator.data["state"]["scheduler"]["schedules"]
-            for schedule in schedules:
-                boost = schedule.get("boost")
-                if boost is None:
-                    continue
-                for event in boost.get("events", []):
-                    if event.get("active") is True:
-                        end_dt = event.get("event_end_dt")
-                        if not end_dt:
-                            return None
-                        result = end_dt.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
-                        return result
-        except (KeyError, ValueError, TypeError) as e:
-            pass
-        return None
+        return boost_end_time(self.coordinator.data)
 
     @property
     def icon(self) -> str: # type: ignore

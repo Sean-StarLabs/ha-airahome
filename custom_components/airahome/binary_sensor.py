@@ -13,6 +13,9 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from homeassistant.util import dt as dt_util
+
+from .boost import boost_end_time
 from .const import CONF_DEVICE_NAME, CONF_DEVICE_UUID, CONF_MAC_ADDRESS, CONF_NUM_ZONES, DEFAULT_NUM_ZONES, DEFAULT_SHORT_NAME, DOMAIN
 from .coordinator import AiraDataUpdateCoordinator, _parse_error
 
@@ -76,6 +79,7 @@ async def async_setup_entry(
             icon=("mdi:pump-off", "mdi:pump"),
             entity_category=EntityCategory.DIAGNOSTIC
         ),
+        AiraWaterBoostActiveSensor(coordinator, entry),
         AiraWeatherHeatingPermissiveBinarySensor(coordinator, entry),
         AiraProblemBinarySensor(
             coordinator,
@@ -379,3 +383,19 @@ class AiraProblemBinarySensor(AiraBaseBinarySensor):
                     )
 
         return attributes
+
+
+class AiraWaterBoostActiveSensor(AiraBaseBinarySensor):
+    """Whether a reported hot water boost has time remaining."""
+
+    def __init__(self, coordinator: AiraDataUpdateCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "dhw_boost_active", icon="mdi:water-boiler")
+
+    @property
+    def available(self) -> bool:
+        return super().available and bool(self.coordinator.data and self.coordinator.data.get("connected"))
+
+    @property
+    def is_on(self) -> bool | None:
+        end = boost_end_time(self.coordinator.data)
+        return end > dt_util.utcnow() if end is not None else None
