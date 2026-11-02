@@ -2,6 +2,7 @@
 from unittest.mock import AsyncMock
 
 import pytest
+from conftest import active_boost_data
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
@@ -39,6 +40,7 @@ async def test_failed_ack_does_not_refresh(hass, runtime, add_platform, updates)
 @pytest.mark.parametrize("during_stream", [False, True])
 @pytest.mark.parametrize("error_type", [TimeoutError, BLEConnectionError])
 async def test_transport_failures(runtime, add_platform, during_stream, error_type):
+    runtime["coordinator"].data = active_boost_data()
     buttons = await add_platform(button)
 
     async def fail(**kwargs):
@@ -59,6 +61,7 @@ async def test_transport_failures(runtime, add_platform, during_stream, error_ty
 async def test_sdk_empty_success_and_stream_closes_before_refresh(runtime, add_platform):
     """Use the SDK protobuf conversion, including its empty success marker."""
     buttons = await add_platform(button)
+    runtime["coordinator"].data["state"]["night_mode_enabled"] = False
     closed = False
     message = CommandProgress()
     message.succeeded.SetInParent()
@@ -94,6 +97,7 @@ async def test_empty_targets_raise(hass, runtime, target):
 
 @pytest.mark.parametrize("target_type", ["entity", "device", "area", "combined"])
 async def test_targets_and_deduplication(hass, runtime, add_platform, target_type):
+    runtime["coordinator"].data = active_boost_data()
     buttons = await add_platform(button)
     entity_ids = [entity.entity_id for entity in buttons.values()]
     device_id = er.async_get(hass).async_get(entity_ids[0]).device_id

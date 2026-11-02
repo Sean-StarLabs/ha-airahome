@@ -7,15 +7,26 @@ from typing import Any
 from homeassistant.util import dt as dt_util
 
 
-def boost_end_time(data: dict[str, Any]) -> datetime | None:
-    """Return the latest active boost end in UTC, or None if it is unknown."""
+def _boost_end_times(data: dict[str, Any]) -> list[datetime] | None:
+    """Read a complete schedule list; missing or malformed data stays unknown."""
     ends = []
     try:
-        for schedule in data["state"]["scheduler"]["schedules"]:
-            if (boost := schedule.get("boost")) is None:
+        schedules = data["state"]["scheduler"]["schedules"]
+        if not isinstance(schedules, list):
+            return None
+        for schedule in schedules:
+            if not isinstance(schedule, dict) or not schedule:
+                return None
+            if "boost" not in schedule:
                 continue
-            for event in boost.get("events", []):
-                if event.get("active") is not True:
+            events = schedule["boost"]["events"]
+            if not isinstance(events, list):
+                return None
+            for event in events:
+                active = event["active"]
+                if not isinstance(active, bool):
+                    return None
+                if not active:
                     continue
                 end = event.get("event_end_dt")
                 if isinstance(end, str):
@@ -28,4 +39,19 @@ def boost_end_time(data: dict[str, Any]) -> datetime | None:
                 ends.append(dt_util.as_utc(end))
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
-    return max(ends, default=None)
+    return ends
+
+
+def boost_end_time(data: dict[str, Any]) -> datetime | None:
+    """Return the latest reported active boost end in UTC, if known."""
+    ends = _boost_end_times(data)
+    return max(ends, default=None) if ends is not None else None
+
+
+def boost_active(data: dict[str, Any]) -> bool | None:
+    """Return whether a reported boost has time left, or None if unknown."""
+    ends = _boost_end_times(data)
+    if ends is None:
+        return None
+    now = dt_util.utcnow()
+    return any(end > now for end in ends)

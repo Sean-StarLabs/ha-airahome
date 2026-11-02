@@ -17,6 +17,7 @@ from .services import (
     SERVICE_CLEAR_AWAY_MODE,
     SERVICE_DEACTIVATE_DHW_BOOST,
     SERVICE_SET_AWAY_MODE,
+    action_unavailable_reason,
 )
 
 BUTTONS = (
@@ -57,14 +58,14 @@ class AiraControlButton(CoordinatorEntity, ButtonEntity):
 
     @property
     def available(self) -> bool:
-        """Require a successful coordinator update and a connected device."""
-        return super().available and bool(self.coordinator.data and self.coordinator.data.get("connected"))
+        """Offer only actions eligible for the latest reported state."""
+        return action_unavailable_reason(self.coordinator, self._service) is None
 
     async def async_press(self) -> None:
         """Apply pending values only on an explicit button press."""
-        if not self.available:
+        if reason := action_unavailable_reason(self.coordinator, self._service):
             raise ServiceValidationError(
-                translation_domain=DOMAIN, translation_key="device_not_connected",
+                translation_domain=DOMAIN, translation_key=reason,
             )
         data = {"entity_id": self.entity_id}
         if self._service == SERVICE_SET_AWAY_MODE:

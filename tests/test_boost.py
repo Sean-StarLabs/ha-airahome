@@ -22,7 +22,7 @@ async def test_boost_expiry(runtime, entry, remaining):
     coordinator = runtime["coordinator"]
     coordinator.data = boost_data(now + timedelta(seconds=remaining))
     sensor = AiraWaterBoostActiveSensor(coordinator, entry)
-    with patch("custom_components.airahome.binary_sensor.dt_util.utcnow", return_value=now):
+    with patch("custom_components.airahome.boost.dt_util.utcnow", return_value=now):
         assert sensor.is_on is (remaining > 0)
     assert sensor.unique_id == "test-pump_dhw_boost_active"
     runtime["aira"].ble._run_command.assert_not_awaited()
@@ -30,8 +30,7 @@ async def test_boost_expiry(runtime, entry, remaining):
 
 @pytest.mark.parametrize("data", [
     {"connected": True, "state": {}},
-    {"connected": True, "state": {"scheduler": {"schedules": []}}},
-    boost_data(None), boost_data("invalid"), boost_data(123), boost_data(None, False),
+    boost_data(None), boost_data("invalid"), boost_data(123),
 ])
 async def test_unknown_timing(runtime, entry, data):
     runtime["coordinator"].data = data

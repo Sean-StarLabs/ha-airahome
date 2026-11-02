@@ -3,6 +3,7 @@ from datetime import date, timedelta
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from conftest import active_boost_data
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
@@ -48,7 +49,9 @@ async def test_setup_and_restore_are_local(hass, entry, runtime, add_platform):
     assert aira.method_calls == []
     coordinator.async_request_refresh.assert_not_awaited()
     assert coordinator.data["state"] == {}
-    assert all(e.available for e in buttons.values())
+    assert not buttons["cancel_dhw_boost"].available
+    assert not buttons["activate_night_mode"].available
+    assert all(e.available for key, e in buttons.items() if key not in {"cancel_dhw_boost", "activate_night_mode"})
     registry = er.async_get(hass)
     for entity in [*dates.values(), *durations.values(), *buttons.values()]:
         registered = registry.async_get(entity.entity_id)
@@ -121,6 +124,10 @@ async def test_invalid_away_dates(runtime, add_platform, start_delta, duration, 
     ("activate_night_mode", ActivateNightModeForOneHour),
 ])
 async def test_dedicated_buttons(runtime, add_platform, key, command_type):
+    if key == "activate_night_mode":
+        runtime["coordinator"].data["state"]["night_mode_enabled"] = False
+    if key == "cancel_dhw_boost":
+        runtime["coordinator"].data = active_boost_data()
     buttons = await add_platform(button)
     await buttons[key].async_press()
     command = runtime["aira"].ble._run_command.call_args.kwargs["command_in"]

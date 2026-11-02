@@ -22,6 +22,7 @@ from pyairahome.commands import (
 )
 from pyairahome.utils.exceptions import BLEConnectionError
 
+from .boost import boost_active
 from .const import DOMAIN
 from .coordinator import AiraDataUpdateCoordinator
 
@@ -62,6 +63,25 @@ SERVICES = [
 ]
 
 
+def action_unavailable_reason(coordinator: AiraDataUpdateCoordinator, service: str) -> str | None:
+    """Share button availability and service validation against reported state."""
+    data = coordinator.data
+    if not coordinator.last_update_success or not data or not data.get("connected"):
+        return "device_not_connected"
+    if service == SERVICE_DEACTIVATE_DHW_BOOST and boost_active(data) is not True:
+        return "no_active_dhw_boost"
+    if service == SERVICE_ACTIVATE_DHW_BOOST and boost_active(data) is True:
+        return "dhw_boost_already_active"
+    if service == SERVICE_ACTIVATE_NIGHT_MODE:
+        state = data.get("state")
+        night = state.get("night_mode_enabled") if isinstance(state, dict) else None
+        if night is True:
+            return "night_mode_already_active"
+        if night is not False:
+            return "night_mode_state_unknown"
+    return None
+
+
 async def _get_coordinators_from_target(
     hass: HomeAssistant, call: ServiceCall,
 ) -> list[AiraDataUpdateCoordinator]:
@@ -88,14 +108,15 @@ async def _get_coordinators_from_target(
 async def _async_run_command(
     coordinator: AiraDataUpdateCoordinator,
     command_in: CommandBase,
+    service: str,
     translation_key: str,
     placeholders: dict[str, str] | None = None,
 ) -> None:
     """Consume command progress and refresh only after a successful ACK."""
-    if not coordinator.last_update_success or not coordinator.data or not coordinator.data.get("connected"):
+    if reason := action_unavailable_reason(coordinator, service):
         raise ServiceValidationError(
             translation_domain=DOMAIN,
-            translation_key="device_not_connected",
+            translation_key=reason,
         )
 
     progress = {}
@@ -129,7 +150,7 @@ async def _handle_activate_dhw_boost(hass: HomeAssistant, call: ServiceCall) -> 
         await _async_run_command(
             coordinator,
             ActivateHotWaterBoosting(hot_water_boost_duration=Duration(seconds=hours * 3600)),
-            "dhw_boost_activate_failed",
+            SERVICE_ACTIVATE_DHW_BOOST, "dhw_boost_activate_failed",
             {"hours": str(hours)},
         )
 
@@ -166,7 +187,7 @@ async def _handle_set_away_mode(hass: HomeAssistant, call: ServiceCall) -> None:
                 end_time=_date_to_timestamp(end_date),
                 target_room_temperature=0.0,  # Matches the app's away mode behaviour.
             ),
-            "away_mode_set_failed",
+            SERVICE_SET_AWAY_MODE, "away_mode_set_failed",
             {"start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
         )
 
@@ -175,21 +196,21 @@ async def _handle_deactivate_dhw_boost(hass: HomeAssistant, call: ServiceCall) -
     """Handle the deactivate_dhw_boost service call."""
     for coordinator in await _get_coordinators_from_target(hass, call):
         await _async_run_command(
-            coordinator, DeactivateHotWaterBoosting(), "dhw_boost_deactivate_failed",
+            coordinator, DeactivateHotWaterBoosting(), SERVICE_DEACTIVATE_DHW_BOOST, "dhw_boost_deactivate_failed",
         )
 
 
 async def _handle_clear_away_mode(hass: HomeAssistant, call: ServiceCall) -> None:
     """Handle the clear_away_mode service call."""
     for coordinator in await _get_coordinators_from_target(hass, call):
-        await _async_run_command(coordinator, ClearAwayMode(), "away_mode_clear_failed")
+        await _async_run_command(coordinator, ClearAwayMode(), SERVICE_CLEAR_AWAY_MODE, "away_mode_clear_failed")
 
 
 async def _handle_activate_night_mode(hass: HomeAssistant, call: ServiceCall) -> None:
     """Activate night mode for the SDK's fixed duration of one hour."""
     for coordinator in await _get_coordinators_from_target(hass, call):
         await _async_run_command(
-            coordinator, ActivateNightModeForOneHour(), "night_mode_activate_failed",
+            coordinator, ActivateNightModeForOneHour(), SERVICE_ACTIVATE_NIGHT_MODE, "night_mode_activate_failed",
         )
 
 

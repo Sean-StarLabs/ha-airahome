@@ -120,3 +120,10 @@ async def add_platform(hass, entry):
     yield add
     for platform in platforms:
         await platform.async_reset()
+
+
+def active_boost_data():
+    """Reported boost with a future end, suitable for cancel commands."""
+    return {"connected": True, "state": {"scheduler": {"schedules": [
+        {"boost": {"events": [{"active": True, "event_end_dt": dt_util.utcnow() + timedelta(hours=1)}]}},
+    ]}}}

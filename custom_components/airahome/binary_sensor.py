@@ -13,9 +13,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from homeassistant.util import dt as dt_util
-
-from .boost import boost_end_time
+from .boost import boost_active
 from .const import CONF_DEVICE_NAME, CONF_DEVICE_UUID, CONF_MAC_ADDRESS, CONF_NUM_ZONES, DEFAULT_NUM_ZONES, DEFAULT_SHORT_NAME, DOMAIN
 from .coordinator import AiraDataUpdateCoordinator, _parse_error
 
@@ -397,5 +395,4 @@ class AiraWaterBoostActiveSensor(AiraBaseBinarySensor):
 
     @property
     def is_on(self) -> bool | None:
-        end = boost_end_time(self.coordinator.data)
-        return end > dt_util.utcnow() if end is not None else None
+        return boost_active(self.coordinator.data)

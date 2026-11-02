@@ -50,6 +50,18 @@
     }
   },
   "exceptions": {
+    "night_mode_state_unknown": {
+      "message": "Night mode state is unknown. Wait for a confirmed off state before activating it."
+    },
+    "no_active_dhw_boost": {
+      "message": "No active hot water boost with a confirmed future end time is reported."
+    },
+    "dhw_boost_already_active": {
+      "message": "A hot water boost is already active."
+    },
+    "night_mode_already_active": {
+      "message": "Night mode is already active."
+    },
     "no_aira_target": {
       "message": "Select at least one loaded Aira heat pump entity, device or area."
     },
