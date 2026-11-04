@@ -19,7 +19,7 @@ from pyairahome.enums import DeviceType
 from pyairahome.utils.exceptions import AuthenticationError
 import voluptuous as vol
 
-from . import connect_with_cache_retry, async_get_translation
+from . import async_cleanup_resources, connect_with_cache_retry, async_get_translation
 from .const import (
     BLE_COMMAND_SLEEP,
     CONF_CERTIFICATE,
@@ -379,18 +379,19 @@ class AiraHomeConfigFlow(ConfigFlow, domain=DOMAIN):
         ble_device = bluetooth.async_ble_device_from_address(
                     self.hass, mac_address, connectable=True
                 )
-        if not self._aira or not ble_device:
+        aira = self._aira
+        if not aira or not ble_device:
             return False, {"error": "ble_device_not_found"}
         
         try:
-            await connect_with_cache_retry(self._aira, ble_device, mac_address)
+            await connect_with_cache_retry(aira, ble_device, mac_address)
 
             installation = {}
 
             # detect phases by checking if phase 1 & 2 voltage/current have any non-zero values
-            configuration: dict[str, dict] = await self._aira.ble._get_configuration() # type: ignore
+            configuration: dict[str, dict] = await aira.ble._get_configuration() # type: ignore
             await asyncio.sleep(BLE_COMMAND_SLEEP) # give the device some time to process the command
-            system_check_state: dict = await self._aira.ble._get_system_check_state() # type: ignore
+            system_check_state: dict = await aira.ble._get_system_check_state() # type: ignore
             energy = system_check_state.get("system_check_state", {}).get("energy_calculation", {})
             three_phase_fields = ("voltage_phase_1", "voltage_phase_2", "current_phase_1", "current_phase_2")
             installation[CONF_NUM_PHASES] = 3 if any(energy.get(f) for f in three_phase_fields) else 1
@@ -398,13 +399,12 @@ class AiraHomeConfigFlow(ConfigFlow, domain=DOMAIN):
             if outdoor_unit_size := configuration.get("config", {}).get("outdoor_unit_size", None):
                 if "NONE" not in outdoor_unit_size and "UNSPECIFIED" not in outdoor_unit_size:
                     installation["outdoor_unit_size"] = outdoor_unit_size # store outdoor unit infos if available
-            # Cleanup in a task to avoid blocking the flow
-            self.hass.async_create_task(self._aira.ble._cleanup())
-
             return True, installation
         except Exception as err:
             _LOGGER.error("BLE connection test failed: %s", err)
             return False, {"error": "cannot_connect"}
+        finally:
+            await async_cleanup_resources(aira)
 
     # Ha auto discovery via bluetooth
     async def async_step_bluetooth(self, discovery_info: BluetoothServiceInfoBleak) -> ConfigFlowResult:

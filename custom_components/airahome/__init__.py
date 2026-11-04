@@ -57,6 +57,29 @@ async def connect_with_cache_retry(aira: AiraHome, ble_device: BLEDevice, mac_ad
         raise BLEConnectionError("BLE connection retry failed after clearing cache")
 
 
+async def async_cleanup_resources(
+    aira: AiraHome, coordinator: AiraDataUpdateCoordinator | None = None
+) -> None:
+    """Stop background work before releasing BLE, including during cancellation."""
+    async def cleanup() -> None:
+        if coordinator is not None:
+            await coordinator.async_shutdown()
+        try:
+            async with asyncio.timeout(10):
+                await aira.ble._cleanup()
+        except TimeoutError:
+            _LOGGER.warning("BLE cleanup timed out")
+        except Exception as err:
+            _LOGGER.warning("Error during BLE cleanup: %s", err)
+
+    cleanup_task = asyncio.create_task(cleanup())
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        await cleanup_task
+        raise
+
+
 PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.WATER_HEATER, Platform.CLIMATE, Platform.DATE, Platform.SELECT, Platform.BUTTON]
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -107,98 +130,83 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info("Setting up Aira Heat Pump integration for device at %s", mac_address)
     
     aira = AiraHome(ext_loop=hass.loop)
-    aira.uuid = device_uuid
-    if certificate:
-        aira.ble.add_certificate(certificate)
-    else:
-        _LOGGER.warning("No certificate found in config entry, some BLE operations will fail")
-    
-    # Connect library logger to Home Assistant's logging system
-    # This ensures pyairahome logs use HA's log level
-    lib_logger = logging.getLogger("pyairahome")
-    lib_logger.setLevel(_LOGGER.level)
+    coordinator: AiraDataUpdateCoordinator | None = None
+    try:
+        aira.uuid = device_uuid
+        if certificate:
+            aira.ble.add_certificate(certificate)
+        else:
+            _LOGGER.warning("No certificate found in config entry, some BLE operations will fail")
 
-    # Get BLE device from Home Assistant's bluetooth integration
-    _LOGGER.debug("Getting BLE device from HA bluetooth integration")
-    ble_device = bluetooth.async_ble_device_from_address(
-        hass, mac_address, connectable=True
-    )
-    if not ble_device:
-        _LOGGER.error(
-            "Device %s not found in Home Assistant's bluetooth. "
-            "Make sure the device is powered on and within range.",
-            mac_address
+        # Connect library logger to Home Assistant's logging system
+        # This ensures pyairahome logs use HA's log level
+        lib_logger = logging.getLogger("pyairahome")
+        lib_logger.setLevel(_LOGGER.level)
+
+        # Get BLE device from Home Assistant's bluetooth integration
+        _LOGGER.debug("Getting BLE device from HA bluetooth integration")
+        ble_device = bluetooth.async_ble_device_from_address(
+            hass, mac_address, connectable=True
         )
-        raise ConfigEntryNotReady("Device not found in Home Assistant's bluetooth. Please ensure the device is powered on and within range.")
-    
-    # Connect aira instance to the device
-    try:
-        await connect_with_cache_retry(aira, ble_device, mac_address)
-    except Exception as conn_err:
-        _LOGGER.error("Initial BLE connection attempt failed: %s", conn_err)
-        raise ConfigEntryNotReady(
-            translation_domain=DOMAIN,
-            translation_key="initial_ble_connection_failed",
-        ) from conn_err
-    
-    # Get scan interval from options or use default
-    scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-    _LOGGER.debug("Using set scan interval of %d seconds", scan_interval)
+        if not ble_device:
+            _LOGGER.error(
+                "Device %s not found in Home Assistant's bluetooth. "
+                "Make sure the device is powered on and within range.",
+                mac_address
+            )
+            raise ConfigEntryNotReady("Device not found in Home Assistant's bluetooth. Please ensure the device is powered on and within range.")
 
-    # Create data update coordinator
-    coordinator = AiraDataUpdateCoordinator(hass, entry, aira, scan_interval, mac_address)
-        
-    try:
-        async with asyncio.timeout(120):
-            await coordinator.async_config_entry_first_refresh()
-    except TimeoutError as err:
-        raise ConfigEntryNotReady("Timed out waiting for first data refresh") from err
+        # Connect aira instance to the device
+        try:
+            await connect_with_cache_retry(aira, ble_device, mac_address)
+        except Exception as conn_err:
+            _LOGGER.error("Initial BLE connection attempt failed: %s", conn_err)
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN,
+                translation_key="initial_ble_connection_failed",
+            ) from conn_err
 
-    # Store the coordinator and AiraHome instance for the platforms to use
-    hass.data[DOMAIN][entry.entry_id] = {
-        "coordinator": coordinator,
-        "aira": aira,
-        "pending_controls": AiraPendingControls(),
-    }
+        # Get scan interval from options or use default
+        scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+        _LOGGER.debug("Using set scan interval of %d seconds", scan_interval)
+
+        # Create data update coordinator
+        coordinator = AiraDataUpdateCoordinator(hass, entry, aira, scan_interval, mac_address)
+
+        try:
+            async with asyncio.timeout(120):
+                await coordinator.async_config_entry_first_refresh()
+        except TimeoutError as err:
+            raise ConfigEntryNotReady("Timed out waiting for first data refresh") from err
+
+        # Store the coordinator and AiraHome instance for the platforms to use
+        hass.data[DOMAIN][entry.entry_id] = {
+            "coordinator": coordinator,
+            "aira": aira,
+            "pending_controls": AiraPendingControls(),
+        }
+
+        # Forward the setup to the platforms
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except BaseException:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        await async_cleanup_resources(aira, coordinator)
+        raise
+
     entry.async_on_unload(coordinator.async_shutdown)
-    
-    # Forward the setup to the platforms
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    
     return True
 
+
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    _LOGGER.info("Unloading Aira Heat Pump integration")
-    
-    # Unload platforms
+    """Unload platforms before stopping their coordinator and transport."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    
-    # Get the stored data before cleanup
-    aira = hass.data[DOMAIN].get(entry.entry_id, {}).get("aira")
-
-    # Coordinator is stopped by homeassistant
-    
-    # Clean up BLE connection and resources
-    if aira and aira.ble:
-        try:
-            _LOGGER.debug("Cleaning up BLE resources")
-            # Use a timeout to prevent hanging during cleanup
-            async with asyncio.timeout(10):
-                await aira.ble._cleanup()
-            _LOGGER.debug("BLE resources cleaned up")
-        except asyncio.TimeoutError:
-            _LOGGER.warning("BLE cleanup timed out")
-        except asyncio.CancelledError:
-            raise
-        except Exception as err:
-            _LOGGER.warning("Error during BLE cleanup: %s", err)
-
-    if unload_ok:
-        # Clean up stored data
-        hass.data[DOMAIN].pop(entry.entry_id)
-        _LOGGER.info("Aira integration unloaded successfully")
-    else:
+    if not unload_ok:
         _LOGGER.warning("Failed to unload some platforms")
+        return False
 
-    return unload_ok
+    runtime = hass.data[DOMAIN].get(entry.entry_id)
+    if runtime:
+        await async_cleanup_resources(runtime["aira"], runtime["coordinator"])
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+    _LOGGER.info("Aira integration unloaded successfully")
+    return True
