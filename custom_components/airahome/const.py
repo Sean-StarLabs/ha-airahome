@@ -33,6 +33,7 @@ CACHE_ERROR_PATTERNS: tuple[str, ...] = (
     "write not permitted",
     "read not permitted",
     "invalid handle",
+    "invalid gatt handle",
     "attribute not found",
     "status=3",
     "status 3",

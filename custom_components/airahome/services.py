@@ -66,7 +66,7 @@ SERVICES = [
 def action_unavailable_reason(coordinator: AiraDataUpdateCoordinator, service: str) -> str | None:
     """Share button availability and service validation against reported state."""
     data = coordinator.data
-    if not coordinator.last_update_success or not data or not data.get("connected"):
+    if not coordinator.last_update_success or not coordinator.command_available:
         return "device_not_connected"
     if service == SERVICE_DEACTIVATE_DHW_BOOST and boost_active(data) is not True:
         return "no_active_dhw_boost"
@@ -119,28 +119,20 @@ async def _async_run_command(
             translation_key=reason,
         )
 
-    progress = {}
+    def validate() -> None:
+        if reason := action_unavailable_reason(coordinator, service):
+            raise ServiceValidationError(translation_domain=DOMAIN, translation_key=reason)
+
     try:
-        async for progress in await coordinator.aira.ble._run_command(command_in=command_in):
-            pass
-    except (BLEConnectionError, TimeoutError) as err:
+        await coordinator.async_execute_command(command_in, validate=validate)
+    except ServiceValidationError:
+        raise
+    except (BLEConnectionError, TimeoutError, HomeAssistantError) as err:
         raise HomeAssistantError(
             translation_domain=DOMAIN,
             translation_key=translation_key,
             translation_placeholders={**(placeholders or {}), "error": str(err)},
         ) from err
-
-    # The SDK represents the protobuf Empty success marker as an empty dict.
-    if "error" in progress or not isinstance(progress.get("succeeded"), dict):
-        raise HomeAssistantError(
-            translation_domain=DOMAIN,
-            translation_key=translation_key,
-            translation_placeholders={
-                **(placeholders or {}),
-                "error": str(progress.get("error", "no confirmation received from device")),
-            },
-        )
-    await coordinator.async_request_refresh()
 
 
 async def _handle_activate_dhw_boost(hass: HomeAssistant, call: ServiceCall) -> None:

@@ -13,6 +13,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .freshness import AiraChannelEntity
 from .boost import boost_active
 from .const import CONF_DEVICE_NAME, CONF_DEVICE_UUID, CONF_MAC_ADDRESS, CONF_NUM_ZONES, DEFAULT_NUM_ZONES, DEFAULT_SHORT_NAME, DOMAIN
 from .coordinator import AiraDataUpdateCoordinator, _parse_error
@@ -121,7 +122,7 @@ async def async_setup_entry(
 # BINARY SENSORS
 # ===========================================================================
 
-class AiraBaseBinarySensor(CoordinatorEntity, BinarySensorEntity): # type: ignore
+class AiraBaseBinarySensor(AiraChannelEntity, CoordinatorEntity, BinarySensorEntity): # type: ignore
     """Base class for Aira binary sensors."""
 
     _attr_has_entity_name = True
@@ -188,8 +189,26 @@ class AiraBinarySensor(AiraBaseBinarySensor):
         self._index = index
 
     @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self._data_path != ("connected",):
+            return None
+        from time import perf_counter
+        now = perf_counter()
+        attributes = {}
+        for channel in ("state", "system_check_state"):
+            stamp = self.coordinator._channel_good.get(channel)
+            attributes[channel + "_status"] = (
+                "fresh" if self.coordinator.channel_available(channel)
+                else "stale" if stamp is not None else "unknown"
+            )
+            attributes[channel + "_age_seconds"] = round(max(0, now - stamp)) if stamp is not None else None
+        return attributes
+
+    @property
     def is_on(self) -> bool | None: # type: ignore
         """Return true if the sensor is on."""
+        if self._data_path == ("connected",):
+            return self.coordinator._is_connected and not self.coordinator._reconnecting and not self.coordinator._closing
         if not self.coordinator.data:
             return None
 
@@ -220,6 +239,8 @@ class AiraBinarySensor(AiraBaseBinarySensor):
 
 class AiraWeatherHeatingPermissiveBinarySensor(AiraBaseBinarySensor):
     """Whether the outdoor temperature averages permit heating mode."""
+
+    _aira_channel = "system_check_state"
 
     # average is misspelled by aira ¯\_(ツ)_/¯
     _AVERAGE_KEYS = {
@@ -297,6 +318,10 @@ class AiraProblemBinarySensor(AiraBaseBinarySensor):
 
     _attr_device_class = BinarySensorDeviceClass.PROBLEM
 
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.channel_available("system_check_state")
+
     def __init__(
         self,
         coordinator: AiraDataUpdateCoordinator,
@@ -353,6 +378,8 @@ class AiraProblemBinarySensor(AiraBaseBinarySensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return additional attributes."""
+        if not self.available:
+            return {"data_status": "stale", "last_reported_codes": [x[2] for x in self._get_matching_errors()]}
         attributes: dict[str, Any] = {}
 
         if self._include_stopping_flags:

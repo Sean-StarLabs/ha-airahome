@@ -1,4 +1,5 @@
 """Data update coordinator for Aira Heat Pump."""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +9,9 @@ from datetime import datetime, timedelta, timezone
 import logging
 from time import perf_counter
 from typing import Any
+from collections.abc import Callable
+
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
@@ -48,7 +52,11 @@ def _parse_error(error: dict[str, Any]) -> tuple[str, str, str, str, Any]:
             display_code = raw_code.removeprefix(prefix).replace("_", " ").title()
             break
 
-    severity = (str(error.get("severity", "SEVERITY_UNSPECIFIED")).removeprefix("SEVERITY_").title())
+    severity = (
+        str(error.get("severity", "SEVERITY_UNSPECIFIED"))
+        .removeprefix("SEVERITY_")
+        .title()
+    )
     return source, display_code, raw_code, severity, error.get("occurred_at")
 
 
@@ -83,7 +91,6 @@ class AiraDataUpdateCoordinator(DataUpdateCoordinator):
         self._is_connected = True
         self._reconnect_task: asyncio.Task[None] | None = None
         self._reconnect_attempts = 0
-        self._max_reconnect_attempts = 5
         # perf_counter timestamp for the next allowed reconnect.
         self._next_reconnect_at = 0.0
         self._needs_cache_clear: bool = False
@@ -91,24 +98,93 @@ class AiraDataUpdateCoordinator(DataUpdateCoordinator):
         # Map raw error codes to their severity and first-seen timestamp.
         self._active_errors: dict[str, tuple[str, str]] = {}
 
-        # Timing and success tracking
-        self._last_successful_data: dict[str, Any] | None = None
-        self._last_successful_timestamp: float | None = None
+        self._io_lock = asyncio.Lock()
+        self._closing = False
+        self._reconnecting = False
+        self._command_needs_readback = False
+        self._channel_data: dict[str, dict[str, Any]] = {}
+        self._channel_good: dict[str, float] = {}
+        self._channel_failed: set[str] = set()
+        self._system_failures = 0
+        self._next_system_check = 0.0
+        self._channel_error_codes: dict[str, list[dict[str, Any]]] = {}
 
         # Initialize coordinator data with empty but valid data structure to prevent sensor crashes
         self.data = deepcopy(DEFAULT_DATA)
 
     async def async_shutdown(self) -> None:
-        """Cancel pending background tasks on integration shutdown/unload."""
+        """Stop admission and wait for owned I/O before transport cleanup."""
+        self._closing = True
         await super().async_shutdown()
+        task = self._reconnect_task
+        if task and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        async with self._io_lock:
+            self._is_connected = False
 
-        if self._reconnect_task and not self._reconnect_task.done():
-            self._reconnect_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError): # Suppress the CancelledError to avoid logging it as an error
-                await self._reconnect_task
-            _LOGGER.debug("Expectedly cancelled pending reconnect task on shutdown")
+    def channel_available(self, channel: str = "state") -> bool:
+        """A cached response is not new evidence that its channel is healthy."""
+        timestamp = self._channel_good.get(channel)
+        return bool(
+            self._is_connected
+            and not self._closing
+            and not self._reconnecting
+            and self.data
+            and self.data.get("connected")
+            and channel not in self._channel_failed
+            and timestamp is not None
+            and 0 <= perf_counter() - timestamp < STALE_DATA_THRESHOLD
+        )
 
-    def _calculate_scheduled_hot_water_temperature(self, state_dict: dict[str, Any]) -> float | None:
+    @property
+    def command_available(self) -> bool:
+        return (
+            self.channel_available()
+            and not self._command_needs_readback
+            and self._reconnect_task is None
+        )
+
+    async def async_execute_command(
+        self, command_in: Any, *, validate: Callable[[], None] | None = None
+    ) -> None:
+        """Own one command through its terminal ACK; never replay an uncertain write."""
+        async with self._io_lock:
+            if not self.command_available or not self._is_connected:
+                raise ServiceValidationError(
+                    "Aira is reconnecting, stale or awaiting readback"
+                )
+            if validate is not None:
+                validate()
+            progress = None
+            stream = None
+            self._command_needs_readback = True
+            self.async_update_listeners()
+            try:
+                async with asyncio.timeout(45):
+                    stream = await self.aira.ble._run_command(command_in=command_in)
+                    async for progress in stream:
+                        pass
+                if (
+                    not isinstance(progress, dict)
+                    or "error" in progress
+                    or not isinstance(progress.get("succeeded"), dict)
+                ):
+                    raise HomeAssistantError("Aira did not confirm the command")
+            finally:
+                if stream is not None and (close := getattr(stream, "aclose", None)):
+                    await close()
+        # A read cannot run while we own the transport lock. No optimistic state writes.
+        await self.async_refresh()
+        if self._command_needs_readback:
+            raise HomeAssistantError(
+                "Aira command acknowledged; fresh readback unavailable"
+            )
+
+    def _calculate_scheduled_hot_water_temperature(
+        self, state_dict: dict[str, Any]
+    ) -> float | None:
         """Calculate the scheduled hot water temperature from scheduler active actions."""
         try:
             scheduler = state_dict.get("scheduler", {})
@@ -126,117 +202,94 @@ class AiraDataUpdateCoordinator(DataUpdateCoordinator):
         except (KeyError, ValueError, TypeError):
             return None
 
-    async def _fetch_all_data(self, start_time: float, rssi: int | None) -> dict[str, Any]:
-        """Fetch all data from the Aira device via BLE."""
-        state_data: dict[str, Any] | None = None
-        system_check_state: dict[str, Any] | None = None
-
-        try:
-            state_data = await self.aira.ble._get_states()  # type: ignore[reportAssignmentType]
-        except Exception as err:
-            _LOGGER.warning("Failed to fetch state data: %s", err)
-            if _is_cache_error(err):
-                self._needs_cache_clear = True
-
-        # Leave enough time between BLE commands for the device to respond reliably.
-        await asyncio.sleep(BLE_COMMAND_SLEEP)
-
-        try:
-            system_check_state = (
-                await self.aira.ble._get_system_check_state()  # type: ignore[reportAssignmentType]
-            )
-        except Exception as err:
-            _LOGGER.warning("Failed to fetch system check state: %s", err)
-            if _is_cache_error(err):
-                self._needs_cache_clear = True
-
-        if state_data is None and system_check_state is None:
-            raise UpdateFailed("Both BLE data fetches failed")
-
-        elapsed = perf_counter() - start_time
-        _LOGGER.debug("BLE data fetch completed in %.1f seconds", elapsed)
-
-        # Build result, merging with stale data if some fetches failed
-        state_dict = state_data.get("state", {}) if state_data else {}
-        system_dict = (
-            system_check_state.get("system_check_state", {})
-            if system_check_state
-            else {}
-        )
-
-        successful = 2
-        # If we have stale data and current fetch returned empty, use stale values
+    @staticmethod
+    def _response_body(response: Any, channel: str) -> dict[str, Any] | None:
+        if not isinstance(response, dict):
+            return None
         if (
-            self._last_successful_data
-            and self._last_successful_timestamp is not None
-            and perf_counter() - self._last_successful_timestamp
-            < STALE_DATA_THRESHOLD
+            response.get("error", "DATA_RESPONSE_ERROR_UNSPECIFIED")
+            != "DATA_RESPONSE_ERROR_UNSPECIFIED"
         ):
-            # Handle empty result or aira errors
-            if (
-                not state_dict and self._last_successful_data.get("state")
-            ) or state_data and (
-                state_data.get("error") != "DATA_RESPONSE_ERROR_UNSPECIFIED"
-            ):
-                state_dict = self._last_successful_data["state"]
-                successful -= 1
-                _LOGGER.debug("Using stale state data due to empty fetch or error")
+            return None
+        body = response.get(channel)
+        if (
+            isinstance(body, dict)
+            and "errors" in body
+            and (
+                not isinstance(body["errors"], list)
+                or any(not isinstance(x, dict) for x in body["errors"])
+            )
+        ):
+            return None
+        return deepcopy(body) if isinstance(body, dict) and body else None
 
-            if (
-                not system_dict
-                and self._last_successful_data.get("system_check_state")
-            ) or system_check_state and (
-                system_check_state.get("error") != "DATA_RESPONSE_ERROR_UNSPECIFIED"
-            ):
-                system_dict = self._last_successful_data["system_check_state"]
-                successful -= 1
-                _LOGGER.debug("Using stale system_check data due to empty fetch or error")
-
-        state_dict["scheduled_hot_water_temperature"] = (
-            self._calculate_scheduled_hot_water_temperature(state_dict)
+    async def _fetch_all_data(
+        self, start_time: float, rssi: int | None
+    ) -> dict[str, Any]:
+        """Track the two responses independently; failed diagnostics cannot clear faults."""
+        received = set()
+        for channel, method in (
+            ("state", self.aira.ble._get_states),
+            ("system_check_state", self.aira.ble._get_system_check_state),
+        ):
+            if channel == "system_check_state":
+                if perf_counter() < self._next_system_check:
+                    continue
+                await asyncio.sleep(BLE_COMMAND_SLEEP)
+            try:
+                async with asyncio.timeout(40):
+                    response = await method()
+                body = self._response_body(response, channel)
+                if body is None:
+                    raise ValueError("Empty or unsuccessful response")
+            except Exception as err:
+                self._channel_failed.add(channel)
+                if _is_cache_error(err):
+                    self._needs_cache_clear = True
+                if channel == "system_check_state":
+                    self._system_failures += 1
+                    self._next_system_check = perf_counter() + min(
+                        60 * 2 ** min(self._system_failures - 1, 4), 900
+                    )
+                _LOGGER.warning("Failed to fetch %s: %s", channel, err)
+                continue
+            received.add(channel)
+            self._channel_failed.discard(channel)
+            self._channel_data[channel] = body
+            self._channel_good[channel] = perf_counter()
+            errors = body.get("errors", [])
+            self._channel_error_codes[channel] = (
+                [x for x in errors if isinstance(x, dict)]
+                if isinstance(errors, list)
+                else []
+            )
+            if channel == "state":
+                self._command_needs_readback = False
+            else:
+                self._system_failures = 0
+                self._next_system_check = 0.0
+        if received and not self._needs_cache_clear:
+            self._reconnect_attempts = 0
+            self._next_reconnect_at = 0.0
+        if not received and not (
+            "state" in self._channel_data and "state" not in self._channel_failed
+        ):
+            raise UpdateFailed("No fresh Aira response")
+        state = deepcopy(self._channel_data.get("state", {}))
+        state["scheduled_hot_water_temperature"] = (
+            self._calculate_scheduled_hot_water_temperature(state)
         )
-
-        result = {
-            "state": state_dict,
-            "system_check_state": system_dict,
+        self._handle_error_changes(
+            [error for errors in self._channel_error_codes.values() for error in errors]
+        )
+        return {
+            "state": state,
+            "system_check_state": deepcopy(
+                self._channel_data.get("system_check_state", {})
+            ),
             "connected": True,
             "rssi": rssi,
         }
-        # Errors can be reported in either response. Deduplicate them by raw code.
-        state_errors = state_dict.get("errors", [])
-        if not isinstance(state_errors, list):
-            state_errors = []
-        system_errors = system_dict.get("errors", [])
-        if not isinstance(system_errors, list):
-            system_errors = []
-
-        seen_codes: set[str] = set()
-        all_errors: list[dict[str, Any]] = []
-        for error in state_errors + system_errors:
-            _, _, raw_code, _, _ = _parse_error(error)
-            if raw_code != "unknown" and raw_code not in seen_codes:
-                seen_codes.add(raw_code)
-                all_errors.append(error)
-
-        self._handle_error_changes(all_errors)
-
-        # Only store as successful if we actually got some real data
-        # Check if at least state data has content (it's the most important)
-        if successful == 2:
-            # Reset reconnect state only after both calls return complete data.
-            self._reconnect_attempts = 0
-            self._next_reconnect_at = 0.0
-            self._last_successful_data = result
-            # Record monotonic timestamp for age checks
-            self._last_successful_timestamp = perf_counter()
-            _LOGGER.debug("Data fetch successful, updated last_successful_data")
-        else:
-            _LOGGER.warning(
-                "Data fetch returned empty state or error, leaving "
-                "last_successful_data as is"
-            )
-
-        return result
 
     def _handle_error_changes(self, errors: list[dict[str, Any]]) -> None:
         """Log errors that appeared or cleared since the previous update."""
@@ -265,7 +318,11 @@ class AiraDataUpdateCoordinator(DataUpdateCoordinator):
             if severity.lower() in {"critical", "error"}:
                 _LOGGER.error(
                     "Aira alarm active on %s: [%s] %s (severity: %s, first_seen_at: %s)",
-                    device_name, source, display_code, severity, first_seen_at,
+                    device_name,
+                    source,
+                    display_code,
+                    severity,
+                    first_seen_at,
                 )
             else:
                 previous_level = _LOGGER.level
@@ -273,21 +330,33 @@ class AiraDataUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.setLevel(logging.WARNING)
                     _LOGGER.warning(
                         "Aira warning active on %s: [%s] %s (severity: %s, first_seen_at: %s)",
-                        device_name, source, display_code, severity, first_seen_at,
+                        device_name,
+                        source,
+                        display_code,
+                        severity,
+                        first_seen_at,
                     )
                 finally:
                     _LOGGER.setLevel(previous_level)
 
         cleared = set(self._active_errors) - current_codes
         for raw_code in cleared:
-            prefix = next((prefix for prefix in ERROR_SOURCE_PREFIXES.values() if raw_code.startswith(prefix)), "",)
+            prefix = next(
+                (
+                    prefix
+                    for prefix in ERROR_SOURCE_PREFIXES.values()
+                    if raw_code.startswith(prefix)
+                ),
+                "",
+            )
             display_name = raw_code.removeprefix(prefix).replace("_", " ").title()
             severity, _ = self._active_errors.pop(raw_code)
 
             if severity.lower() in {"critical", "error"}:
                 _LOGGER.error(
                     "Aira alarm cleared on %s: %s",
-                    device_name, display_name,
+                    device_name,
+                    display_name,
                 )
             else:
                 previous_level = _LOGGER.level
@@ -295,188 +364,96 @@ class AiraDataUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.setLevel(logging.WARNING)
                     _LOGGER.warning(
                         "Aira warning cleared on %s: %s",
-                        device_name, display_name,
+                        device_name,
+                        display_name,
                     )
                 finally:
                     _LOGGER.setLevel(previous_level)
 
-    async def _async_clear_gatt_cache(self) -> None:
-        """Safely clear the BLE GATT cache for this device."""
+    async def _async_clear_gatt_cache(self) -> bool:
         if not self.mac_address:
-            return
-
-        _LOGGER.info(
-            "Clearing BLE GATT cache for %s due to suspected stale cache",
-            self.mac_address,
-        )
+            return False
         try:
-            await self.aira.ble._clear_cache(self.mac_address)
-        except Exception as err:
-            _LOGGER.warning("GATT cache clear raised: %s", err)
-        finally:
+            async with asyncio.timeout(10):
+                cleared = await self.aira.ble._clear_cache(self.mac_address)
+        except Exception:
+            _LOGGER.warning("Aira GATT cache clear failed")
+            return False
+        if cleared:
             self._needs_cache_clear = False
+        return bool(cleared)
 
     async def _async_reconnect(self) -> None:
-        """Attempt to reconnect to the device in a background task scheduled by _schedule_reconnect."""
-        aira = self.aira
-        mac_address: str = self.mac_address  # type: ignore[assignment]
-
+        """Connection replacement and normal I/O share one owner."""
         try:
-            if self._needs_cache_clear:
-                await self._async_clear_gatt_cache()
-
-            # Explicitly disconnect to clean up any stale connection state
-            _LOGGER.debug("Disconnecting before reconnection attempt")
-            try:
-                await aira.ble._disconnect()
-            except Exception as err:
-                _LOGGER.debug("Disconnect during reconnect raised: %s (nothing to worry about)", err)
-
-            # Small delay to let the BLE stack stabilize
-            await asyncio.sleep(0.5)
-
-            ble_device = bluetooth.async_ble_device_from_address(
-                self.hass, mac_address, connectable=True
-            )
-            if not ble_device:
-                _LOGGER.error(
-                    "Device %s not found in Home Assistant's bluetooth during reconnect attempt.",
-                    mac_address,
-                )
-                return
-
-            _LOGGER.info("Attempting reconnection to %s", ble_device.name)
-            try:
-                # Use standard connection (has built-in retry logic)
-                success = await aira.ble._connect_device(
-                    ble_device,
-                    timeout=BLE_CONNECT_TIMEOUT,
-                )
-            except Exception as err:
-                _LOGGER.error("Reconnection attempt raised exception: %s", err)
-                if _is_cache_error(err):
-                    self._needs_cache_clear = True
-                    # Try purging the cache now so the next attempt starts cleanly.
-                    await self._async_clear_gatt_cache()
-                success = False
-        except Exception as err:
-            _LOGGER.error(
-                "Unexpected error during reconnection attempt: %s",
-                err,
-                exc_info=True,
-            )
-            success = False
-
-        if success:
-            _LOGGER.info("Reconnected to Aira device via BLE successfully")
-            self._is_connected = True
-        else:
-            _LOGGER.warning("Reconnection attempt to Aira device via BLE failed")
-            self._is_connected = False
+            async with self._io_lock:
+                if self._closing:
+                    return
+                self._reconnecting = True
+                self._is_connected = False
+                self._reconnect_attempts += 1
+                delay = BLE_RECONNECT_BACKOFF[
+                    min(self._reconnect_attempts - 1, len(BLE_RECONNECT_BACKOFF) - 1)
+                ]
+                self._next_reconnect_at = perf_counter() + delay
+                self.async_update_listeners()
+                try:
+                    if self._needs_cache_clear:
+                        await self._async_clear_gatt_cache()
+                    async with asyncio.timeout(45):
+                        await self.aira.ble._disconnect()
+                        await asyncio.sleep(0.5)
+                        device = bluetooth.async_ble_device_from_address(
+                            self.hass, self.mac_address, connectable=True
+                        )
+                        if device is None:
+                            return
+                        self._is_connected = bool(
+                            await self.aira.ble._connect_device(
+                                device, timeout=BLE_CONNECT_TIMEOUT
+                            )
+                        )
+                except Exception as err:
+                    if _is_cache_error(err):
+                        self._needs_cache_clear = True
+                    _LOGGER.warning("Aira reconnect failed: %s", err)
+                finally:
+                    self._reconnecting = False
+                    self.async_update_listeners()
+        finally:
+            self._reconnect_task = None
 
     def _schedule_reconnect(self) -> None:
-        """Schedule a reconnect attempt in a background task."""
-        if self._reconnect_task and not self._reconnect_task.done():
-            return  # already scheduled
-
-        self._reconnect_task = self.hass.async_create_task(self._async_reconnect())
+        if (
+            self._closing
+            or self._reconnect_task is not None
+            or perf_counter() < self._next_reconnect_at
+        ):
+            return
+        self._reconnect_task = self.hass.async_create_background_task(
+            self._async_reconnect(), "Aira BLE reconnect"
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data from Aira device via BLE."""
-        start_time = perf_counter()
-
-        mac_address: str = self.mac_address  # type: ignore[assignment]
-        is_connected = self._is_connected
-
-        rssi = None
-
-        try:
-            # Get RSSI from Home Assistant's bluetooth integration
-            try:
-                # Get service info which contains RSSI
-                service_info = bluetooth.async_last_service_info(
-                    self.hass, mac_address, connectable=True
+        async with self._io_lock:
+            if self._closing:
+                raise UpdateFailed("Aira is closing")
+            rssi = None
+            with contextlib.suppress(Exception):
+                info = bluetooth.async_last_service_info(
+                    self.hass, self.mac_address, connectable=True
                 )
-                if service_info and service_info.rssi is not None:
-                    rssi = service_info.rssi
-            except Exception:
-                # Fallback: try getting from device
+                if info is not None:
+                    rssi = info.rssi
+            if self._is_connected:
                 try:
-                    async with asyncio.timeout(5):
-                        rssi = await self.aira.ble._get_rssi()
-                except TimeoutError:
-                    _LOGGER.debug("Fallback RSSI fetch timed out")
+                    data = await self._fetch_all_data(perf_counter(), rssi)
+                except UpdateFailed:
+                    self._is_connected = False
                 else:
-                    _LOGGER.debug("Fallback RSSI fetch used")
-
-            if not is_connected:
-                _LOGGER.warning(
-                    "Device not connected. Raising UpdateFailed to trigger reconnect logic."
-                )
-                raise UpdateFailed("Device not connected")
-
-            # Fetch data
-            try:
-                # get data
-                data = await self._fetch_all_data(start_time, rssi)
-                _LOGGER.debug("Gathered data in %.1f seconds", perf_counter() - start_time)
-                return data
-            except Exception as data_err:
-                _LOGGER.error("Error fetching data: %s", data_err)
-                raise UpdateFailed from data_err
-
-        except Exception as err:
-            # Attempt to reconnect if not connected
-            if is_connected:
-                _LOGGER.error("Unexpected error during data update: %s. Considering disconnected", err, exc_info=True)
-                self._is_connected = False
-                is_connected = False
-
-            # Device is not connected, return stale data if available and recent enough
-            stale_result = None
-            if self._last_successful_data and self._last_successful_timestamp:
-                age = start_time - self._last_successful_timestamp
-                if age < STALE_DATA_THRESHOLD:
-                    _LOGGER.debug(
-                        "Not connected, returning stale data (age: %.0f seconds)",
-                        age,
-                    )
-                    stale_result = deepcopy(self._last_successful_data)
-                    stale_result["connected"] = False
-                    stale_result["rssi"] = rssi
-
-            # Device is not connected, attempt reconnection with exponential backoff
-            if self._reconnect_attempts < self._max_reconnect_attempts:
-                now = perf_counter()
-                if now >= self._next_reconnect_at:
-                    _LOGGER.debug(
-                        "Not connected, scheduling reconnect (attempt %d/%d)",
-                        self._reconnect_attempts + 1,
-                        self._max_reconnect_attempts,
-                    )
-                    self._schedule_reconnect()
-                    delay = BLE_RECONNECT_BACKOFF[min(self._reconnect_attempts, len(BLE_RECONNECT_BACKOFF) - 1)]
-                    self._next_reconnect_at = now + delay
-                    self._reconnect_attempts += 1
-                else:
-                    _LOGGER.debug(
-                        "Backoff active, next reconnect in %.0f seconds",
-                        self._next_reconnect_at - now
-                    )
-            else:
-                # Max attempts reached -> schedule a full entry reload so HA cleanly tears down BLE,
-                # re-runs async_setup_entry and retries with native ConfigEntryNotReady backoff.
-                # See https://github.com/Invy55/ha-airahome/wiki/Bluetooth-Issues
-                _LOGGER.error(
-                    "Max reconnect attempts (%d) reached, scheduling entry reload.",
-                    self._max_reconnect_attempts
-                )
-                self._reconnect_attempts = 0
-                self._next_reconnect_at = 0.0
-                self.hass.async_create_task(
-                    self.hass.config_entries.async_reload(self.config_entry.entry_id)
-                )
-
-            if stale_result is not None:
-                return stale_result
-            raise UpdateFailed("Device not connected and no usable stale data") from err
+                    if self._needs_cache_clear:
+                        # A real GATT error needs one paced recovery, even after partial success.
+                        self._schedule_reconnect()
+                    return data
+            self._schedule_reconnect()
+            raise UpdateFailed("Aira disconnected; reconnect scheduled")

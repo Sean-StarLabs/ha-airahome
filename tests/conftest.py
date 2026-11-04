@@ -1,6 +1,7 @@
 """Offline fixtures using real Home Assistant entities and registries."""
 import logging
 from datetime import timedelta
+from time import perf_counter
 from types import MappingProxyType
 from unittest.mock import AsyncMock, Mock
 
@@ -79,7 +80,11 @@ async def runtime(hass, entry):
     coordinator = AiraDataUpdateCoordinator(hass, entry, aira)
     coordinator.update_interval = None
     coordinator.async_set_updated_data({"connected": True, "state": {}})
-    coordinator.async_request_refresh = AsyncMock()
+    coordinator._channel_good = {"state": perf_counter(), "system_check_state": perf_counter()}
+    async def refresh():
+        coordinator._channel_good["state"] = perf_counter()
+        coordinator._command_needs_readback = False
+    coordinator.async_refresh = AsyncMock(side_effect=refresh)
     data = {
         "aira": aira, "coordinator": coordinator,
         "pending_controls": AiraPendingControls(),
@@ -108,10 +113,10 @@ async def add_platform(hass, entry):
         for entity in entities:
             key = entity.unique_id.removeprefix("test-pump_")
             entity.entity_id = f"{domain}.{key}"
-            if restored and key in restored:
+            if restored and key in restored and isinstance(entity, restore_state.RestoreEntity):
                 from homeassistant.core import State
-                restore_state.async_get(hass).last_states[entity.entity_id] = restore_state.StoredState(
-                    State(entity.entity_id, restored[key]), None, dt_util.utcnow(),
+                entity.async_get_last_state = AsyncMock(
+                    return_value=State(entity.entity_id, restored[key]),
                 )
         await platform.async_add_entities(entities)
         assert len(platform.entities) == len(entities)

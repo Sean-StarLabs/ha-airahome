@@ -32,6 +32,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 import homeassistant.util.dt as dt_util
 
+from .freshness import AiraChannelEntity
 from .boost import boost_end_time
 from .const import (
     CONF_DEVICE_NAME,
@@ -457,7 +458,7 @@ async def async_setup_entry(
 # BASE SENSOR CLASS
 # ============================================================================
 
-class AiraSensorBase(CoordinatorEntity, SensorEntity): # type: ignore
+class AiraSensorBase(AiraChannelEntity, CoordinatorEntity, SensorEntity): # type: ignore
     """Base class for Aira sensors."""
 
     _attr_has_entity_name = True
@@ -780,6 +781,12 @@ class AiraPowerSensor(AiraSensorBase):
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_suggested_display_precision = 3
 
+    @property
+    def available(self) -> bool:
+        return super().available and (
+            not self._allowed_status or self.coordinator.channel_available("state")
+        )
+
     def __init__(
         self,
         coordinator: AiraDataUpdateCoordinator,
@@ -888,6 +895,8 @@ class AiraInstantHeatSensor(AiraSensorBase):
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
     _attr_suggested_display_precision = 3
+
+    _aira_channel = "system_check_state"
 
     def __init__(
         self,
@@ -1005,6 +1014,8 @@ class AiraEnergyBalanceSensor(AiraSensorBase):
 
     _attr_name = "Energy Balance"
     _attr_state_class = SensorStateClass.MEASUREMENT
+
+    _aira_channel = "system_check_state"
 
     def __init__(self, coordinator: AiraDataUpdateCoordinator, entry: ConfigEntry) -> None:
         """Initialise the sensor."""
@@ -1157,6 +1168,8 @@ class AiraEEVStepSensor(AiraSensorBase):
     _attr_name = "Electronic Expansion Valve Step"
     _attr_state_class = SensorStateClass.MEASUREMENT
 
+    _aira_channel = "system_check_state"
+
     def __init__(self, coordinator: AiraDataUpdateCoordinator, entry: ConfigEntry) -> None:
         """Initialise the sensor."""
         unique_id_suffix = "eev_step"
@@ -1304,6 +1317,8 @@ class AiraLEDPatternSensor(AiraSensorBase):
 class AiraInstantCOPSensor(AiraSensorBase):
     """Instant COP sensor."""
 
+    _aira_channel = "system_check_state"
+
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = None
     _attr_suggested_display_precision = 2
@@ -1333,6 +1348,8 @@ class AiraInstantCOPSensor(AiraSensorBase):
 class AiraCumulativeCOPSensor(AiraSensorBase):
     """Cumulative COP sensor."""
 
+    _aira_channel = "system_check_state"
+
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = None
     _attr_suggested_display_precision = 2
@@ -1358,6 +1375,8 @@ class AiraCumulativeCOPSensor(AiraSensorBase):
 
 class AiraDeviceCOPSensor(AiraSensorBase):
     """Device-reported COP sensor (real-time from heat pump)."""
+
+    _aira_channel = "system_check_state"
 
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = None
@@ -1393,6 +1412,12 @@ class AiraCurveSensor(AiraSensorBase):
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_suggested_display_precision = 2
+
+    _aira_channel = "system_check_state"
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.channel_available("state")
 
     def __init__(
         self,

@@ -33,7 +33,7 @@ async def test_failed_ack_does_not_refresh(hass, runtime, add_platform, updates)
     with pytest.raises(HomeAssistantError) as exc:
         await buttons["clear_away"].async_press()
     assert exc.value.translation_key == "away_mode_clear_failed"
-    runtime["coordinator"].async_request_refresh.assert_not_awaited()
+    runtime["coordinator"].async_refresh.assert_not_awaited()
     assert runtime["coordinator"].data["state"] == {}
 
 
@@ -55,7 +55,7 @@ async def test_transport_failures(runtime, add_platform, during_stream, error_ty
     with pytest.raises(HomeAssistantError) as exc:
         await buttons["cancel_dhw_boost"].async_press()
     assert exc.value.translation_key == "dhw_boost_deactivate_failed"
-    runtime["coordinator"].async_request_refresh.assert_not_awaited()
+    runtime["coordinator"].async_refresh.assert_not_awaited()
 
 
 async def test_sdk_empty_success_and_stream_closes_before_refresh(runtime, add_platform):
@@ -79,12 +79,13 @@ async def test_sdk_empty_success_and_stream_closes_before_refresh(runtime, add_p
         return progress()
 
     async def refresh():
+        runtime["coordinator"]._command_needs_readback = False
         assert closed
 
     runtime["aira"].ble._run_command.side_effect = run
-    runtime["coordinator"].async_request_refresh = AsyncMock(side_effect=refresh)
+    runtime["coordinator"].async_refresh = AsyncMock(side_effect=refresh)
     await buttons["activate_night_mode"].async_press()
-    runtime["coordinator"].async_request_refresh.assert_awaited_once()
+    runtime["coordinator"].async_refresh.assert_awaited_once()
 
 
 @pytest.mark.parametrize("target", [{}, {"entity_id": []}, {"entity_id": "button.missing"}, {"device_id": "missing"}, {"area_id": "missing"}])
@@ -111,7 +112,7 @@ async def test_targets_and_deduplication(hass, runtime, add_platform, target_typ
     }
     await hass.services.async_call(DOMAIN, "deactivate_dhw_boost", targets[target_type], blocking=True)
     runtime["aira"].ble._run_command.assert_awaited_once()
-    runtime["coordinator"].async_request_refresh.assert_awaited_once()
+    runtime["coordinator"].async_refresh.assert_awaited_once()
 
 
 @pytest.mark.parametrize("hours", [0, 5, 25, "invalid"])
