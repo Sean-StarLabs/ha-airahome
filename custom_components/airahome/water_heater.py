@@ -1,7 +1,8 @@
 """Water heater platform for Aira Heat Pump."""
 from __future__ import annotations
 
-import logging
+import asyncio
+import math
 from typing import Any
 
 from homeassistant.components.water_heater import WaterHeaterEntity, WaterHeaterEntityFeature
@@ -16,13 +17,10 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from pyairahome import AiraHome
 from pyairahome.commands import SetTargetHotWaterTemperature
-from pyairahome.utils.exceptions import BLEConnectionError
 
 from .const import CONF_DEVICE_NAME, CONF_DEVICE_UUID, CONF_INSTALLATION, CONF_MAC_ADDRESS, DEFAULT_SHORT_NAME, DOMAIN
 from .coordinator import AiraDataUpdateCoordinator
-
-
-_LOGGER = logging.getLogger(__name__)
+from .freshness import AiraChannelEntity
 
 
 async def async_setup_entry(
@@ -45,7 +43,7 @@ async def async_setup_entry(
 # WATER HEATER
 # ============================================================================
 
-class AiraWaterHeater(CoordinatorEntity, WaterHeaterEntity): # type: ignore
+class AiraWaterHeater(AiraChannelEntity, CoordinatorEntity, WaterHeaterEntity): # type: ignore
     """Representation of an Aira Heat Pump DHW (Domestic Hot Water) system."""
 
     _attr_has_entity_name = True
@@ -81,6 +79,7 @@ class AiraWaterHeater(CoordinatorEntity, WaterHeaterEntity): # type: ignore
         self._attr_unique_id = f"{self._device_uuid}_{unique_id_suffix}"
         self._attr_translation_key = unique_id_suffix
         self.aira = aira
+        self._temperature_lock = asyncio.Lock()
 
         self._attr_device_info = DeviceInfo(**{
             "identifiers": {(DOMAIN, self._device_uuid)},
@@ -102,122 +101,74 @@ class AiraWaterHeater(CoordinatorEntity, WaterHeaterEntity): # type: ignore
             return None
     
     @property
-    def target_temperature(self): # type: ignore
-        """Return the setpoint temperature considering scheduled temperatures."""
+    def target_temperature(self) -> float | None:
+        """Read the scheduled override or manual target from reported state."""
         try:
-            value = self.coordinator.data.get("state", {}).get("scheduled_hot_water_temperature")
-            return round(float(value), 2) if value is not None else None
-        except (KeyError, ValueError, TypeError):
+            state = self.coordinator.data.get("state", {})
+            value = state.get("target_hot_water_temperature")
+            for action in state.get("scheduler", {}).get("active_actions", []):
+                if "set_dhw_setpoint" in action:
+                    value = action["set_dhw_setpoint"].get("temperature")
+                    break
+            result = float(value) if value is not None else None
+            return round(result, 2) if result is not None and math.isfinite(result) else None
+        except (AttributeError, ValueError, TypeError):
             return None
-    
-    async def _set_temperature(self, temperature: float) -> None:
-        """Set the water heater temperature to the specified value."""
-        _LOGGER.debug("Setting water heater temperature to %s°C", temperature)
-        command_in = SetTargetHotWaterTemperature(temperature=temperature)
 
-        try:
-            updates = [x async for x in await self.aira.ble._run_command(command_in=command_in)] # type: ignore
-            if "succeeded" in updates[-1]:
-                return
-            error = updates[-1].get("error", "no confirmation received from device")
-        except (BLEConnectionError, TimeoutError) as e:
-            _LOGGER.error("Error setting water heater temperature: %s", str(e))
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="water_heater_temp_failed",
-                translation_placeholders={"temperature": str(temperature), "error": str(e)},
-            ) from e
-
-        _LOGGER.error("Failed to set water heater temperature: %s", error)
-        raise HomeAssistantError(
-            translation_domain=DOMAIN,
-            translation_key="water_heater_temp_failed",
-            translation_placeholders={"temperature": str(temperature), "error": str(error)},
-        )
-
-    async def _fake_temperature_set(self, temperature: float) -> None:
-        """Fake setting the water heater temperature (for propagating change to the entire integration asap)."""
-        _LOGGER.debug("Faking setting water heater temperature to %s°C", temperature)
-        try:
-            self.coordinator.data['state']['target_hot_water_temperature'] = temperature
-            self._attr_target_temperature = temperature
-            self.coordinator.async_update_listeners() # force every entity subscribed to the coordinator to update
-        except (KeyError, TypeError):
-            pass
+    def _validate_manual_target(self, previous: float | None) -> None:
+        """Recheck scheduler ownership and the target under the command lock."""
+        state = self.coordinator.data.get("state", {})
+        for action in state.get("scheduler", {}).get("active_actions", []):
+            if "set_dhw_setpoint" in action:
+                raise ServiceValidationError(
+                    translation_domain=DOMAIN, translation_key="scheduler_active",
+                )
+        if previous is None or self.target_temperature != previous:
+            raise ServiceValidationError("Hot water target changed or is unknown; refresh before retrying")
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set new target temperature."""
-        using_scheduler = False
-        states = self.coordinator.data.get('state', {})
-        scheduler = states.get('scheduler', {})
-        for action in scheduler.get('active_actions', []):
-            if 'set_dhw_setpoint' in action:
-                using_scheduler = True
-                break
-
-        previous_temp = self.target_temperature
-        if not previous_temp:
-            return
-
-        if using_scheduler:
-            _LOGGER.warning("Cannot set temperature manually while scheduler is active.")
-            raise ServiceValidationError(
-                translation_domain=DOMAIN,
-                translation_key="scheduler_active"
-            )
-
+        """Set an explicit target and await reported readback, without optimism."""
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
             raise ServiceValidationError(
-                translation_domain=DOMAIN,
-                translation_key="temperature_not_provided"
+                translation_domain=DOMAIN, translation_key="temperature_not_provided",
             )
+        try:
+            requested = float(temperature)
+        except (ValueError, TypeError) as err:
+            raise ServiceValidationError("Invalid hot water temperature") from err
+        if not math.isfinite(requested):
+            raise ServiceValidationError("Invalid hot water temperature")
 
-        temp = float(temperature)
-        
-        if self._attr_target_temperature_step and previous_temp is not None and abs(int(temp*10 - previous_temp*10)) == self._attr_target_temperature_step*10:
-            # used + - buttons, calculate closest allowed temperature
-            if temp < previous_temp: # pressed -
-                # If we're already at the minimum allowed temperature, stay there
-                if previous_temp == min(self._allowed_temperatures):
-                    closest_temp = previous_temp
-                else:
-                    # Find the next lower temperature in allowed values
-                    lower_temps = [t for t in self._allowed_temperatures if t < previous_temp]
-                    closest_temp = max(lower_temps) if lower_temps else previous_temp
-            else: # pressed +
-                # If we're already at the maximum allowed temperature, stay there
-                if previous_temp == max(self._allowed_temperatures):
-                    closest_temp = previous_temp
-                else:
-                    # Find the next higher temperature in allowed values
-                    higher_temps = [t for t in self._allowed_temperatures if t > previous_temp]
-                    closest_temp = min(higher_temps) if higher_temps else previous_temp
-
-            if closest_temp and closest_temp != previous_temp:
-                _LOGGER.debug("Closest temperature found. Setting water heater temperature to %s°C", closest_temp)
-                await self._set_temperature(closest_temp)
-                await self._fake_temperature_set(closest_temp)
-                return
-        else:
-            # Check if the temperature is in the allowed list
-            if temp not in self._allowed_temperatures:
-                allowed_temps_str = ", ".join(map(str, self._allowed_temperatures))
-                raise ServiceValidationError(
-                    translation_domain=DOMAIN,
-                    translation_key="invalid_temperature",
-                    translation_placeholders={
-                        "allowed_temperatures": allowed_temps_str,
-                        "temperature": temperature
-                    },
-                )
-            await self._set_temperature(temp)
-            _LOGGER.debug("Selected temperature allowed. Setting water heater temperature to %s°C", temp)
-            await self._fake_temperature_set(temp)
-            return
-
-        if previous_temp:
-            await self._fake_temperature_set(previous_temp)  # Ensure state is consistent
+        previous = self.target_temperature
+        async with self._temperature_lock:
+            self._validate_manual_target(previous)
+            if math.isclose(abs(requested - previous), self._attr_target_temperature_step):
+                candidates = [
+                    value for value in self._allowed_temperatures
+                    if (value > previous if requested > previous else value < previous)
+                ]
+                if not candidates:
+                    return
+                target = min(candidates) if requested > previous else max(candidates)
+            else:
+                target = requested
+                if target not in self._allowed_temperatures:
+                    raise ServiceValidationError(
+                        translation_domain=DOMAIN,
+                        translation_key="invalid_temperature",
+                        translation_placeholders={
+                            "allowed_temperatures": ", ".join(map(str, self._allowed_temperatures)),
+                            "temperature": str(temperature),
+                        },
+                    )
+            await self.coordinator.async_execute_command(
+                SetTargetHotWaterTemperature(temperature=target),
+                validate=lambda: self._validate_manual_target(previous),
+            )
+            # An ACK confirms receipt, not that the requested target was read back.
+            if self.target_temperature != target:
+                raise HomeAssistantError("Hot water command acknowledged, but target readback is unconfirmed")
 
     @property
     def current_operation(self): # type: ignore

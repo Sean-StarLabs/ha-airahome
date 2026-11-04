@@ -47,13 +47,13 @@ async def test_setup_and_restore_are_local(hass, entry, runtime, add_platform):
     assert len(buttons) == 5
     aira.ble._run_command.assert_not_awaited()
     assert aira.method_calls == []
-    coordinator.async_request_refresh.assert_not_awaited()
+    coordinator.async_refresh.assert_not_awaited()
     assert coordinator.data["state"] == {}
     assert not buttons["cancel_dhw_boost"].available
     assert not buttons["activate_night_mode"].available
     assert all(e.available for key, e in buttons.items() if key not in {"cancel_dhw_boost", "activate_night_mode"})
     registry = er.async_get(hass)
-    for entity in [*dates.values(), *durations.values(), *buttons.values()]:
+    for entity in [*dates.values(), durations["dhw_boost_duration"], *buttons.values()]:
         registered = registry.async_get(entity.entity_id)
         assert registered.unique_id == entity.unique_id
         assert registered.config_entry_id == entry.entry_id
@@ -81,7 +81,7 @@ async def test_boost_duration_and_start(hass, runtime, add_platform, hours):
     command = runtime["aira"].ble._run_command.call_args.kwargs["command_in"]
     assert isinstance(command, ActivateHotWaterBoosting)
     assert command.to_message().hot_water_boost_duration.seconds == hours * 3600
-    runtime["coordinator"].async_request_refresh.assert_awaited_once()
+    runtime["coordinator"].async_refresh.assert_awaited_once()
     assert runtime["coordinator"].data["state"] == {}
 
 
@@ -100,7 +100,7 @@ async def test_away_dates_apply_only_on_press(runtime, add_platform):
     assert message.current_time.ToDatetime().isoformat() == f"{start}T00:00:00"
     assert message.end_time.ToDatetime().isoformat() == f"{end}T00:00:00"
     assert message.target_room_temperature == 0.0
-    runtime["coordinator"].async_request_refresh.assert_awaited_once()
+    runtime["coordinator"].async_refresh.assert_awaited_once()
 
 
 @pytest.mark.parametrize(("start_delta", "duration", "error"), [
@@ -133,7 +133,7 @@ async def test_dedicated_buttons(runtime, add_platform, key, command_type):
     command = runtime["aira"].ble._run_command.call_args.kwargs["command_in"]
     assert isinstance(command, command_type)
     assert command.to_message().SerializeToString() == b""
-    runtime["coordinator"].async_request_refresh.assert_awaited_once()
+    runtime["coordinator"].async_refresh.assert_awaited_once()
 
 
 @pytest.mark.parametrize(("connected", "success"), [(False, True), (True, False)])
