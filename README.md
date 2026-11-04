@@ -28,7 +28,7 @@ The goal is to give you real control over your heat pump from within Home Assist
 
 Once set up, you get:
 
-- **Climate control** — heating and cooling setpoints, HVAC mode, per-zone control
+- **Climate control** — zone heating setpoints and an explicit whole-pump heating/cooling mode select
 - **Hot water control** — DHW target temperature, boost mode, scheduler awareness
 - **Sensors** — temperatures, power, energy, COP, flow rates, compressor data, and more
 - **Binary sensors** — connection status, active modes, alarms, circulator pumps
@@ -37,7 +37,7 @@ Once set up, you get:
 
 Away dates and boost duration are local selections restored across restarts. Editing them does not change the heat pump. Press **Activate Away** or **Start DHW boost** to apply them. New selections default to today, three days later, and one hour. Away activation requires a start date of today or later and at least three days between dates; restored dates are validated again when activated.
 
-**Clear Away** and **Cancel DHW boost** send their dedicated cancel commands. Night mode lasts one hour and has no early cancel command in the SDK. Buttons require a connected heat pump. Commands request a state refresh after acknowledgement; existing mode sensors report the device state. **DHW boost active** compares the reported boost end with the current time on each coordinator update and is unknown when schedule data is missing or malformed. A complete schedule list with no active boost reports off. Cancel boost is available only for a confirmed unexpired boost; Start boost is unavailable while that boost is active. Night activation requires the reported night mode boolean to be false. Services enforce the same checks. Away actions remain available while connected: the current Away enabled flag does not establish whether a future Away schedule exists. Existing climate, hot water and schedule controls are unchanged.
+**Clear Away** and **Cancel DHW boost** send their dedicated cancel commands. Night mode lasts one hour and has no early cancel command in the SDK. Buttons require a connected heat pump. Commands request a state refresh after acknowledgement; existing mode sensors report the device state. **DHW boost active** compares the reported boost end with the current time on each coordinator update and is unknown when schedule data is missing or malformed. A complete schedule list with no active boost reports off. Cancel boost is available only for a confirmed unexpired boost; Start boost is unavailable while that boost is active. Night activation requires the reported night mode boolean to be false. Services enforce the same checks. Away actions remain available while connected: the current Away enabled flag does not establish whether a future Away schedule exists. Zone climate entities control heating setpoints only; use the Whole pump heating/cooling mode select for pump-wide permissions. Hot water controls retain scheduler ownership.
 
 For the full list of available entities, see the [Features & Entities](https://github.com/Invy55/ha-airahome/wiki/Features-and-Entities) wiki page.
 
